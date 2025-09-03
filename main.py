@@ -40,3 +40,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# pip install playwright
+# NODE_OPTIONS='' PLAYWRIGHT_BROWSERS_PATH=0  playwright install chromium
+# NODE_OPTIONS='' playwright install-deps
