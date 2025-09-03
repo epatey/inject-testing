@@ -11,6 +11,19 @@ user_data_dir.mkdir()
 
 print(f"hoping to use {user_data_dir=}")
 
+# When running as a PyInstaller onefile binary, all bundled shared libs are extracted
+# under sys._MEIPASS. Ensure the dynamic linker can find them by prepending that
+# lib directory to LD_LIBRARY_PATH before launching Chromium.
+if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+  meipass = Path(getattr(sys, "_MEIPASS"))
+  lib_dir = meipass / "lib"
+  existing_ld = os.environ.get("LD_LIBRARY_PATH", "")
+  new_ld = f"{lib_dir}:{existing_ld}" if existing_ld else str(lib_dir)
+  os.environ["LD_LIBRARY_PATH"] = new_ld
+  # Hint Playwright to use packaged browsers and skip host validation inside minimal containers
+  os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "0")
+  os.environ.setdefault("PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS", "1")
+
 
 def main():
   print("in main")
