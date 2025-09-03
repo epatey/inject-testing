@@ -217,7 +217,7 @@ def find_headless_shell() -> Path:
     )
 
 
-def parse_ldd_paths(ldd_output: str) -> Set[Path]:
+def parse_ldd_paths(ldd_output: str) -> List[Path]:
     """
     Parse the output of the ldd command to extract library paths.
     
@@ -263,10 +263,10 @@ def parse_ldd_paths(ldd_output: str) -> Set[Path]:
         
         paths.add(Path(candidate))
     
-    return paths
+    return sorted(paths)
 
 
-def ldd_deps(binary: Path) -> Set[Path]:
+def ldd_deps(binary: Path) -> List[Path]:
     """
     Use ldd to discover all shared library dependencies of a binary.
     
@@ -286,7 +286,12 @@ def ldd_deps(binary: Path) -> Set[Path]:
     out = run(["ldd", str(binary)])
     
     # Parse the output to extract library paths
-    return parse_ldd_paths(out)
+    ldd_paths = parse_ldd_paths(out)
+
+    print(f"Found {len(ldd_paths)} shared libraries via ldd")
+    print("\n".join(str(p) for p in ldd_paths))
+
+    return ldd_paths
 
 
 def ldconfig_lookup(name: str) -> Optional[Path]:
@@ -452,9 +457,9 @@ def stage_libs(headless_shell: Path) -> List[str]:
     # The :lib suffix tells PyInstaller to place these in a lib/ subdirectory
     add_bin_args: List[str] = []
     for f in sorted(BUILD_LIBS.glob("*")):
-        # Format: --add-binary /path/to/lib.so:lib
+        # Format: --add-binary=/path/to/lib.so:lib
         # This bundles the library and makes it available at runtime in lib/
-        add_bin_args.extend(["--add-binary", f"{str(f)}:lib"])
+        add_bin_args.extend([f"--add-binary={str(f)}:lib"])
     
     return add_bin_args
 
@@ -500,6 +505,9 @@ def build_pyinstaller(add_bin_args: Iterable[str]) -> None:
             str(ENTRYPOINT.name),  # The main Python script to bundle
         ]
     )
+
+    print("# PyInstaller command:")
+    print("\n".join(cmd))
 
     # Run PyInstaller in the script directory so relative paths work correctly
     run(cmd, cwd=SCRIPT_DIR, env=env)
