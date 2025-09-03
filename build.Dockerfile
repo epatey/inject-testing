@@ -1,14 +1,13 @@
-FROM debian:bookworm-slim
+FROM python:3.10-slim-bullseye
 
 # Install system dependencies required for Python, PyInstaller, and Chromium libs discovery
 RUN apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     ca-certificates \
-    python3 \
-    python3-venv \
-    python3-pip \
-    python3-dev \
+    gcc \
+    g++ \
     build-essential \
+    scons \
     patchelf \
     git \
     && \
@@ -22,7 +21,11 @@ ENV PATH="/opt/venv/bin:${PATH}"
 
 # Install Python dependencies into the venv
 RUN python -m pip install --no-cache-dir --upgrade pip && \
-    python -m pip install --no-cache-dir pyinstaller playwright
+    python -m pip install --no-cache-dir \
+    pyinstaller \
+    playwright \
+    git+https://github.com/JonathonReinhart/staticx.git@add-type-checking
+
 
 # Ensure Playwright installs Chromium into package path and installs runtime deps
 ENV PLAYWRIGHT_BROWSERS_PATH=0
@@ -35,8 +38,9 @@ COPY main.py /build/
 
 # Run the build using the venv Python
 RUN python build.py && \
+    staticx --strip dist/main dist/main_stripped && \
     mkdir -p /out && \
-    cp -v dist/main /out/main && \
+    cp -v dist/main_stripped /out/main && \
     chmod +x /out/main
 
 # Not shipping this image; keep single-stage and expose artifact at /out

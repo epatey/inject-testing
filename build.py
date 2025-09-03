@@ -5,45 +5,41 @@ PORTABLE PLAYWRIGHT PYINSTALLER BUILD SCRIPT
 ================================================================================
 
 PURPOSE:
-This script creates a fully self-contained, portable executable from a Playwright-based
-Python application using PyInstaller. It solves the complex problem of bundling Chromium
-browser dependencies with the application to ensure it can run on different Linux systems
-without requiring users to install Playwright or Chromium separately.
+This script uses PyInstaller to create a fully self-contained, portable executable
+from a Python application that uses Playwright and a headless browser. It solves
+the problem of bundling Chromium dependencies with the application to ensure it
+can run on different Linux systems without requiring users to install Playwright
+or Chromium separately.
 
-KEY CHALLENGES ADDRESSED:
-1. Browser Dependency Management: Playwright normally downloads browsers to a user's home
-   directory, but this script embeds Chromium directly into the package.
-2. Shared Library Dependencies: Chromium requires numerous system libraries that may not
-   be present on target systems. This script identifies and bundles these libraries.
-3. Cross-Distribution Compatibility: By bundling most libraries (except core glibc),
-   the resulting executable can run on various Linux distributions.
-4. NSS (Network Security Services) Libraries: These security libraries are dynamically
-   loaded by Chromium at runtime and must be explicitly included.
+WHY MANUAL DEPENDENCY COLLECTION IS REQUIRED:
+PyInstaller automatically handles Python module dependencies and their C extensions,
+but it does NOT analyze or bundle dependencies of standalone binaries included via
+--add-binary. When we include Chromium's headless_shell executable, PyInstaller
+treats it as a data file and doesn't discover its shared library dependencies. This
+script manually uses ldd to find these dependencies and explicitly bundles them,
+which PyInstaller cannot do automatically.
 
 WORKFLOW:
 1. Install Chromium into the Playwright package directory (not user home)
-2. Locate the headless_shell binary that Playwright uses for Chromium
+2. Locate the chromium-headless-shell binary that Playwright uses for Chromium
 3. Use ldd to discover all shared library dependencies
-4. Explicitly add NSS libraries that may be loaded dynamically
+4. Explicitly add NSS and WebGL libraries that may be loaded dynamically
 5. Bundle everything into a single executable with PyInstaller
 
 OUTPUT:
 A single executable file in dist/main that contains:
-- Your Python application code
+- Embedded python interpreter
+- The python application code
 - The Playwright library
 - Chromium browser (headless_shell)
 - All necessary shared libraries
 - NSS security libraries
+- WebGL libraries
 
 COMPATIBILITY:
-- Architecture-agnostic (works on x86_64, ARM64, etc.)
-- Distribution-agnostic (tested on Ubuntu, Debian, Alpine, etc.)
-- Excludes core glibc libraries to maintain ABI compatibility with host system
-
-Usage:
-  .venv/bin/python build.py    # to prefer your project venv
-  python build.py              # to use whatever python is on PATH
-================================================================================
+- Requires same or newer glibc version as build system (core glibc libraries are
+  excluded to maintain ABI compatibility)
+- For true cross-distribution compatibility, run StaticX on the output
 """
 
 import glob
@@ -53,11 +49,10 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Iterable, List, Optional, Set
+from typing import Iterable
 
-# ================================================================================
-# CONFIGURATION CONSTANTS
-# ================================================================================
+# Import playwright to find its installation directory
+import playwright  # type: ignore
 
 # Directory where this build script is located
 SCRIPT_DIR = Path(__file__).parent.resolve()
@@ -68,85 +63,53 @@ BUILD_LIBS = SCRIPT_DIR / "build_libs"
 # The main Python script that will be the entry point of the executable
 ENTRYPOINT = SCRIPT_DIR / "main.py"
 
-# Core system libraries that should NOT be bundled
-# These are provided by the host OS and bundling them would break compatibility
-# The dynamic linker (ld-linux) and core C libraries must match the host system
-LDD_EXCLUDES = (
-    "ld-linux",  # Dynamic linker/loader - must match host kernel
-    "libc.so",  # Core C library - defines system ABI
-    "libm.so",  # Math library - part of core glibc
-    "libpthread.so",  # POSIX threads - part of core glibc
-    "libdl.so",  # Dynamic loading - part of core glibc
-    "librt.so",  # Real-time extensions - part of core glibc
-)
 
-# NSS (Network Security Services) libraries required by Chromium
-# These are often loaded dynamically at runtime using dlopen(), so they
-# don't always appear in ldd output. We must explicitly include them.
-# These handle SSL/TLS, certificates, and cryptographic operations.
-NSS_NAMES = [
-    "libsoftokn3.so",  # Software token implementation for NSS
-    "libsoftokn3.chk",  # Checksum file for libsoftokn3
-    "libnss3.so",  # Main NSS library
-    "libnssutil3.so",  # NSS utility functions
-    "libsmime3.so",  # S/MIME cryptographic functions
-    "libssl3.so",  # SSL/TLS protocol implementation
-    "libnssckbi.so",  # Built-in root certificates (CRITICAL for HTTPS)
-    "libnspr4.so",  # Netscape Portable Runtime (NSS dependency)
-    "libplc4.so",  # NSPR library for classic I/O
-    "libplds4.so",  # NSPR library for data structures
-    "libfreebl3.so",  # Freebl cryptographic library
-    "libfreeblpriv3.so",  # Private Freebl functions
-]
-
-
-def run(cmd: List[str], cwd: Optional[Path] = None, env: Optional[dict] = None) -> str:
+def main() -> None:
     """
-    Execute a shell command and return its output.
+    Main orchestration function that runs the complete build process.
 
-    This is a wrapper around subprocess.run that:
-    - Captures both stdout and stderr
-    - Raises an exception with detailed error info if the command fails
-    - Returns stdout as a string for successful commands
+    This function coordinates all steps in sequence:
+    1. Verify PyInstaller is available
+    2. Install Chromium into the package directory
+    3. Find the headless_shell binary
+    4. Collect all required libraries
+    5. Build the final executable with PyInstaller
 
-    Args:
-        cmd: List of command arguments (first element is the executable)
-        cwd: Working directory for the command (optional)
-        env: Environment variables for the command (optional)
-
-    Returns:
-        The stdout output of the command as a string
-
-    Raises:
-        RuntimeError: If the command exits with non-zero status, includes
-                     the command, stdout, and stderr in the error message
+    The result is a portable executable that includes everything needed
+    to run Playwright with Chromium on any compatible Linux system.
     """
-    res = subprocess.run(cmd, cwd=cwd, env=env, text=True, capture_output=True)
-    if res.returncode != 0:
-        # Provide detailed error information for debugging
-        raise RuntimeError(
-            f"Command failed: {' '.join(cmd)}\nstdout:\n{res.stdout}\nstderr:\n{res.stderr}"
-        )
-    return res.stdout
+    # Verify build environment
+    _ensure_pyinstaller_available()
+
+    # Install browser into package (not user home)
+    headless_shell = _install_chromium_headless_shell()
+
+    # Collect and stage all extra dependencies/libraries
+    if BUILD_LIBS.exists():
+        shutil.rmtree(BUILD_LIBS)
+    BUILD_LIBS.mkdir(parents=True, exist_ok=True)
+
+    _stage_libraries(_ldd_deps(headless_shell), "ldd dependencies")
+    _stage_libraries(_nss_deps(), "NSS dependencies")
+    _stage_libraries(_webgl_deps(), "WebGL dependencies")
+
+    # Each library needs a --add-binary argument in the format "source:dest"
+    # The :lib suffix tells PyInstaller to place these in a lib/ subdirectory
+    add_binary_args = [f"--add-binary={str(f)}:lib" for f in BUILD_LIBS.glob("*")]
+
+    _build_executable(add_binary_args)
 
 
-def ensure_pyinstaller_available() -> None:
-    """
-    Verify that PyInstaller is installed in the current Python environment.
+def _run(cmd: list[str], cwd: Path | None = None, env: dict | None = None) -> str:
+    return subprocess.run(
+        cmd, cwd=cwd, env=env, text=True, capture_output=True, check=True
+    ).stdout
 
-    This function attempts to run PyInstaller's version command to confirm
-    it's available. If PyInstaller is not found, it raises an error with
-    instructions on how to install it.
 
-    This check is performed early to fail fast if the build environment
-    is not properly configured.
-
-    Raises:
-        RuntimeError: If PyInstaller is not installed, includes installation instructions
-    """
+def _ensure_pyinstaller_available() -> None:
     try:
         # Try to run PyInstaller as a module to check if it's available
-        run([sys.executable, "-m", "PyInstaller", "--version"])
+        _run([sys.executable, "-m", "PyInstaller", "--version"])
     except RuntimeError as e:
         # Provide helpful error message with installation command
         raise RuntimeError(
@@ -155,7 +118,7 @@ def ensure_pyinstaller_available() -> None:
         ) from e
 
 
-def playwright_install_chromium() -> None:
+def _install_chromium_headless_shell() -> Path:
     """
     Install Chromium browser into the Playwright package directory.
 
@@ -174,16 +137,17 @@ def playwright_install_chromium() -> None:
     print("[1/4] Ensuring Chromium is installed into the Playwright package path")
 
     # Run playwright install command with modified environment
-    run([sys.executable, "-m", "playwright", "install", "chromium"], env=env)
+    _run(
+        [sys.executable, "-m", "playwright", "install", "chromium-headless-shell"],
+        env=env,
+    )
+
+    return _find_chromium_headless_shell()
 
 
-def find_headless_shell() -> Path:
+def _find_chromium_headless_shell() -> Path:
     """
     Locate the headless_shell binary within the Playwright package.
-
-    headless_shell is Chromium's headless-only binary that Playwright uses
-    for browser automation. It's smaller than the full Chrome binary and
-    designed for server/automation use cases.
 
     The binary is typically located at:
     playwright/driver/package/.local-browsers/chromium-*/chrome-linux/headless_shell
@@ -196,9 +160,6 @@ def find_headless_shell() -> Path:
                           that Chromium installation may have failed
     """
     print("[2/4] Locating headless_shell used by Playwright")
-
-    # Import playwright to find its installation directory
-    import playwright  # type: ignore
 
     # Get the playwright package directory
     pkg = Path(playwright.__file__).parent
@@ -217,7 +178,7 @@ def find_headless_shell() -> Path:
     )
 
 
-def parse_ldd_paths(ldd_output: str) -> List[Path]:
+def _parse_ldd_paths(ldd_output: str) -> list[Path]:
     """
     Parse the output of the ldd command to extract library paths.
 
@@ -237,42 +198,37 @@ def parse_ldd_paths(ldd_output: str) -> List[Path]:
     Returns:
         Set of Path objects for libraries that should be bundled
     """
-    paths: Set[Path] = set()
+    # Core system libraries that should NOT be bundled
+    # These are provided by the host OS and bundling them would break compatibility
+    # The dynamic linker (ld-linux) and core C libraries must match the host system
+    LDD_EXCLUDES = (
+        "ld-linux",  # Dynamic linker/loader - must match host kernel
+        "libc.so",  # Core C library - defines system ABI
+        "libm.so",  # Math library - part of core glibc
+        "libpthread.so",  # POSIX threads - part of core glibc
+        "libdl.so",  # Dynamic loading - part of core glibc
+        "librt.so",  # Real-time extensions - part of core glibc
+    )
 
-    for line in ldd_output.splitlines():
-        # Skip lines without "=>" (like linux-vdso or statically linked)
-        if "=>" not in line:
-            continue
-
-        # Extract the path after "=>"
-        # Regex captures the non-whitespace path after "=> "
-        m = re.search(r"=>\s+(\S+)", line)
-        if not m:
-            continue
-
-        candidate = m.group(1)
-
-        # Skip non-absolute paths (like "not found")
-        if not candidate.startswith("/"):
-            continue
-
-        # Filter out core system libraries that must not be bundled
-        # These libraries define the system ABI and must match the host
-        if any(ex in candidate for ex in LDD_EXCLUDES):
-            continue
-
-        paths.add(Path(candidate))
-
-    return sorted(paths)
+    return [
+        Path(m.group(1))
+        for line in ldd_output.splitlines()
+        if "=>"
+        in line  # Skip lines without "=>" (like linux-vdso or statically linked)
+        for m in [re.search(r"=>\s+(\S+)", line)]  # Extract the path after "=>"
+        if m
+        and m.group(1).startswith("/")  # Skip non-absolute paths (like "not found")
+        and not any(
+            ex in m.group(1) for ex in LDD_EXCLUDES
+        )  # Filter out core system libraries
+    ]
 
 
-def ldd_deps(binary: Path) -> List[Path]:
+def _ldd_deps(binary: Path) -> list[Path]:
     """
     Use ldd to discover all shared library dependencies of a binary.
 
-    ldd (List Dynamic Dependencies) shows all shared libraries that a binary
-    links against. This is architecture-agnostic - it will work correctly
-    whether running on x86_64, ARM64, or other architectures.
+    These are the libraries explicitly linked by headless_shell.
 
     Args:
         binary: Path to the executable to analyze
@@ -280,63 +236,110 @@ def ldd_deps(binary: Path) -> List[Path]:
     Returns:
         Set of paths to required shared libraries (excluding core system libs)
     """
-    print("[3/4] Collecting shared libraries via ldd (arch-agnostic)")
+    print("[3/4] Collecting shared libraries via ldd")
 
-    # Run ldd on the binary
-    out = run(["ldd", str(binary)])
-
-    # Parse the output to extract library paths
-    ldd_paths = parse_ldd_paths(out)
-
-    print(f"Found {len(ldd_paths)} shared libraries via ldd")
-    print("\n".join(str(p) for p in ldd_paths))
-
-    return ldd_paths
+    return _parse_ldd_paths(_run(["ldd", str(binary)]))
 
 
-def ldconfig_lookup(name: str) -> Optional[Path]:
+# Cache for ldconfig output to avoid multiple calls
+_ldconfig_cache: dict[str, Path] | None = None
+
+
+def _get_ldconfig_cache() -> dict[str, Path]:
     """
-    Look up a library by name using the ldconfig cache.
+    Build and cache a dictionary of library names to paths from ldconfig output.
 
-    ldconfig maintains a cache of shared libraries on the system.
-    Using 'ldconfig -p' prints this cache, which is faster than
-    searching the filesystem and respects the system's library
-    configuration (ld.so.conf).
-
-    Args:
-        name: Library filename to search for (e.g., "libnss3.so")
+    This function runs ldconfig once and parses its output into a dictionary
+    for fast lookups. The cache is stored globally to avoid repeated calls.
 
     Returns:
-        Path to the library if found, None otherwise
+        Dictionary mapping library names to their file paths
     """
+    global _ldconfig_cache
+
+    if _ldconfig_cache is not None:
+        return _ldconfig_cache
+
+    _ldconfig_cache = {}
+
     # Check if ldconfig is available (might not be in minimal containers)
     if shutil.which("ldconfig"):
         try:
             # Get the library cache listing
-            out = run(["ldconfig", "-p"])
+            out = _run(["ldconfig", "-p"])
 
             for line in out.splitlines():
                 # ldconfig -p format:
                 # libX11.so.6 (libc6,x86-64) => /lib/x86_64-linux-gnu/libX11.so.6
 
-                # Check if this line is for our library (must start with name + space)
-                if not line.strip().startswith(name + " "):
+                line = line.strip()
+                if not line or "=>" not in line:
                     continue
 
+                # Split on first space to get library name
+                parts = line.split(" ", 1)
+                if len(parts) < 2:
+                    continue
+
+                lib_name = parts[0]
+
                 # Extract the path after "=>"
-                m = re.search(r"=>\s+(\S+)$", line.strip())
+                m = re.search(r"=>\s+(\S+)$", line)
                 if m:
                     p = Path(m.group(1))
-                    # Verify the file actually exists
+                    # Verify the file actually exists and cache it
                     if p.exists():
-                        return p
+                        _ldconfig_cache[lib_name] = p
         except Exception:
-            # ldconfig might fail in some environments, continue with fallback
+            # ldconfig might fail in some environments, continue with empty cache
             pass
-    return None
+
+    return _ldconfig_cache
 
 
-def find_nss_lib(name: str) -> Optional[Path]:
+def _webgl_deps() -> list[Path]:
+    """
+    Best-effort include graphics libraries
+
+    libGLESv2 is needed for WebGL support but location varies by distribution
+    """
+    return [
+        Path(gpath)
+        for pattern in ("/usr/lib/*-linux-gnu/libGLESv2.so*",)
+        for gpath in glob.glob(pattern)
+        if Path(gpath).exists()
+    ]
+
+
+def _nss_deps() -> list[Path]:
+    """
+    Locate the NSS (Network Security Services) Libraries.
+
+    These security libraries are dynamically loaded by Chromium at runtime for HTTPS
+    support and must be explicitly included.
+    """
+    # NSS (Network Security Services) libraries handle SSL/TLS, certificates, and
+    # cryptographic operations and are required by Chromium. These are often loaded
+    # dynamically at runtime using dlopen(), so they don't always appear in ldd output.
+    NSS_NAMES = [
+        "libsoftokn3.so",  # Software token implementation for NSS
+        "libsoftokn3.chk",  # Checksum file for libsoftokn3
+        "libnss3.so",  # Main NSS library
+        "libnssutil3.so",  # NSS utility functions
+        "libsmime3.so",  # S/MIME cryptographic functions
+        "libssl3.so",  # SSL/TLS protocol implementation
+        "libnssckbi.so",  # Built-in root certificates (CRITICAL for HTTPS)
+        "libnspr4.so",  # Netscape Portable Runtime (NSS dependency)
+        "libplc4.so",  # NSPR library for classic I/O
+        "libplds4.so",  # NSPR library for data structures
+        "libfreebl3.so",  # Freebl cryptographic library
+        "libfreeblpriv3.so",  # Private Freebl functions
+    ]
+
+    return [path for name in NSS_NAMES if (path := _find_nss_lib(name))]
+
+
+def _find_nss_lib(name: str) -> Path | None:
     """
     Find an NSS library by name, trying multiple strategies.
 
@@ -349,12 +352,12 @@ def find_nss_lib(name: str) -> Optional[Path]:
         name: NSS library filename (e.g., "libnssckbi.so")
 
     Returns:
-        Path to the library if found, None otherwise
+        Path to the library if found, None otherwise.
+        Any returned Path is guaranteed to exist at the time of return.
     """
     # Strategy 1: Try ldconfig cache (fastest)
-    p = ldconfig_lookup(name)
-    if p:
-        return p
+    if path := _get_ldconfig_cache().get(name):
+        return path
 
     # Strategy 2: Search common library directories
     # Different distributions use different layouts:
@@ -370,13 +373,13 @@ def find_nss_lib(name: str) -> Optional[Path]:
     return None
 
 
-def copy_unique(src: Path, dest_dir: Path) -> None:
+def _stage_dependency(src: Path, dest_dir: Path) -> None:
     """
-    Copy a library file to the destination directory, resolving symlinks.
+    Copy a dependency file (typically a lib) to the destination directory, resolving symlinks.
 
     Many libraries are symlinks (e.g., libfoo.so -> libfoo.so.1.2.3).
-    This function follows symlinks to copy the actual file content,
-    ensuring the bundled library is complete and functional.
+    This function follows symlinks to copy the actual file content, ensuring the
+    bundled library is complete and functional.
 
     Args:
         src: Source library path (may be a symlink)
@@ -393,87 +396,27 @@ def copy_unique(src: Path, dest_dir: Path) -> None:
     shutil.copy2(src, target, follow_symlinks=True)
 
 
-def stage_libs(headless_shell: Path) -> List[str]:
+def _stage_libraries(dependencies: Iterable[Path], description: str) -> None:
     """
-    Collect all required libraries and prepare PyInstaller arguments.
-
-    This is the core function that:
-    1. Identifies all shared libraries needed by headless_shell
-    2. Explicitly adds NSS libraries (for HTTPS support)
-    3. Optionally includes graphics libraries (for WebGL support)
-    4. Stages all libraries in a temporary directory
-    5. Generates PyInstaller --add-binary arguments
+    Stage multiple libraries to the BUILD_LIBS directory with error handling.
 
     Args:
-        headless_shell: Path to the Chromium headless_shell binary
-
-    Returns:
-        List of PyInstaller --add-binary arguments for including libraries
+        libraries: Iterable of library paths to stage
+        description: Optional description for error messages
     """
-    # Clean and recreate the staging directory
-    if BUILD_LIBS.exists():
-        shutil.rmtree(BUILD_LIBS)
-    BUILD_LIBS.mkdir(parents=True, exist_ok=True)
-
-    # Step 1: Collect libraries identified by ldd
-    # These are the libraries explicitly linked by headless_shell
-    deps = ldd_deps(headless_shell)
-    for lib in sorted(deps):
+    print(f"\nStaging {description} dependencies")
+    for dependency in dependencies:
         try:
-            copy_unique(lib, BUILD_LIBS)
-        except Exception as e:
+            _stage_dependency(dependency, BUILD_LIBS)
+            print(f"\t{dependency}")
+        except OSError as e:
             # Some libraries might be inaccessible, continue with others
-            print(f"WARN: failed to copy {lib}: {e}")
-
-    # Step 2: Add NSS libraries explicitly
-    # These are dynamically loaded at runtime for HTTPS support
-    # Without these, HTTPS connections will fail with certificate errors
-    for name in NSS_NAMES:
-        p = find_nss_lib(name)
-        if p and p.exists():
-            print(f"Copying {p} to {BUILD_LIBS}")
-            try:
-                copy_unique(p, BUILD_LIBS)
-            except Exception as e:
-                print(f"WARN: failed to copy {p}: {e}")
-        else:
-            # Not all NSS components are required on all systems
-            print(f"WARN: NSS component not found: {name}")
-
-    # Step 3: Best-effort include graphics libraries
-    # libGLESv2 is needed for WebGL support but location varies by distribution
-    for pattern in ("/usr/lib/*-linux-gnu/libGLESv2.so*",):
-        for gpath in glob.glob(pattern):
-            gp = Path(gpath)
-            if gp.exists():
-                try:
-                    copy_unique(gp, BUILD_LIBS)
-                except Exception as e:
-                    # Graphics libraries are optional, don't fail the build
-                    print(f"WARN: failed to copy {gp}: {e}")
-
-    # Step 4: Generate PyInstaller arguments
-    # Each library needs a --add-binary argument in the format "source:dest"
-    # The :lib suffix tells PyInstaller to place these in a lib/ subdirectory
-    add_bin_args: List[str] = []
-    for f in sorted(BUILD_LIBS.glob("*")):
-        # Format: --add-binary=/path/to/lib.so:lib
-        # This bundles the library and makes it available at runtime in lib/
-        add_bin_args.extend([f"--add-binary={str(f)}:lib"])
-
-    return add_bin_args
+            print(f"WARN: failed to copy {dependency}: {e}")
 
 
-def build_pyinstaller(add_bin_args: Iterable[str]) -> None:
+def _build_executable(extra_binaries: list[str]) -> None:
     """
     Execute PyInstaller to create the final executable.
-
-    This function runs PyInstaller with carefully chosen options:
-    - --onefile: Create a single executable file (not a directory)
-    - --noupx: Don't use UPX compression (can cause issues with some libraries)
-    - --collect-all playwright: Include all playwright package files
-    - --copy-metadata=playwright: Include package metadata (version info, etc.)
-    - --add-binary: Include all collected shared libraries
 
     The resulting executable will self-extract to a temporary directory
     at runtime and set up the library paths appropriately.
@@ -494,55 +437,32 @@ def build_pyinstaller(add_bin_args: Iterable[str]) -> None:
             "-m",
             "PyInstaller",
             "--onefile",  # Single executable output
-            "--noupx",  # Disable UPX compression (improves compatibility)
+            "--strip",
+            "--optimize",
+            "2",
             "--collect-all",  # Collect all files from the playwright package
             "playwright",  # Package name for --collect-all
             "--copy-metadata=playwright",  # Include playwright metadata
+            "--exclude-module",
+            "tkinter",
+            "--exclude-module",
+            "test",
+            "--exclude-module",
+            "unittest",
+            "--exclude-module",
+            "pdb",
         ]
-        + list(add_bin_args)  # Add all the --add-binary arguments for libraries
-        + [
-            "-F",  # Shorthand for --onefile (redundant but explicit)
-            str(ENTRYPOINT.name),  # The main Python script to bundle
-        ]
+        + extra_binaries  # --add-binary arguments
+        + [str(ENTRYPOINT.name)]  # the main Python script to bundle
     )
 
     print("# PyInstaller command:")
     print("\n".join(cmd))
 
     # Run PyInstaller in the script directory so relative paths work correctly
-    run(cmd, cwd=SCRIPT_DIR, env=env)
+    _run(cmd, cwd=SCRIPT_DIR, env=env)
 
     print("Build complete: dist/main")
-
-
-def main() -> None:
-    """
-    Main orchestration function that runs the complete build process.
-
-    This function coordinates all steps in sequence:
-    1. Verify PyInstaller is available
-    2. Install Chromium into the package directory
-    3. Find the headless_shell binary
-    4. Collect all required libraries
-    5. Build the final executable with PyInstaller
-
-    The result is a portable executable that includes everything needed
-    to run Playwright with Chromium on any compatible Linux system.
-    """
-    # Step 1: Verify build environment
-    ensure_pyinstaller_available()
-
-    # Step 2: Install browser into package (not user home)
-    playwright_install_chromium()
-
-    # Step 3: Locate the browser binary
-    headless_shell = find_headless_shell()
-
-    # Step 4: Collect and stage all required libraries
-    add_bin_args = stage_libs(headless_shell)
-
-    # Step 5: Build the final executable
-    build_pyinstaller(add_bin_args)
 
 
 if __name__ == "__main__":
