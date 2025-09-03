@@ -26,8 +26,8 @@ RUN python -m pip install --no-cache-dir --upgrade pip && \
 
 # Ensure Playwright installs Chromium into package path and installs runtime deps
 ENV PLAYWRIGHT_BROWSERS_PATH=0
-RUN PLAYWRIGHT_BROWSERS_PATH=0 playwright install
-RUN PLAYWRIGHT_BROWSERS_PATH=0 playwright install-deps
+RUN playwright install chromium-headless-shell
+RUN playwright install-deps
 
 # Copy build scripts
 COPY build.py /build/
